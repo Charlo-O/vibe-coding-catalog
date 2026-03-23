@@ -51,3 +51,4 @@ npm run pipeline
 
 - 本地测试：手动运行 `npm run pipeline`
 - GitHub Pages：将 `CATALOG_BASE_URL` 设为你的 Pages 地址，并将 `CATALOG_OUTPUT_DIR` 设为 `docs`
+- 自动化部署：仓库内提供 [`.github/workflows/pipeline.yml`](./.github/workflows/pipeline.yml)，会在推送到 `main` 和每 6 小时定时运行时自动采集并部署到 Pages
