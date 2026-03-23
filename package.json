@@ -1,0 +1,16 @@
+{
+  "name": "vibe-coding-catalog",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Low-cost static catalog for vibe coding software with automated discovery.",
+  "type": "module",
+  "scripts": {
+    "discover": "node scripts/discover.mjs",
+    "build": "node scripts/build-site.mjs",
+    "pipeline": "npm run discover && npm run build",
+    "build:pages": "node scripts/build-site.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

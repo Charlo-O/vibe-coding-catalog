@@ -1,0 +1,22 @@
+[
+  {
+    "name": "OpenAI",
+    "url": "https://openai.com/blog/rss.xml",
+    "type": "rss"
+  },
+  {
+    "name": "OpenAI News",
+    "url": "https://openai.com/news/rss.xml",
+    "type": "rss"
+  },
+  {
+    "name": "Vercel",
+    "url": "https://vercel.com/atom",
+    "type": "atom"
+  },
+  {
+    "name": "GitHub Blog",
+    "url": "https://github.blog/feed/",
+    "type": "rss"
+  }
+]
