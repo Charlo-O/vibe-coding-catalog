@@ -1,10 +1,13 @@
 import {
   AUTO_PUBLISH_SCORE,
   CLASSIFICATION_RULES,
+  EXPANDED_PUBLISH_SCORE,
   GENERIC_DOMAINS,
+  HARD_EXCLUSION_LABELS,
   LAUNCH_PATTERNS,
   NEGATIVE_PATTERNS,
   POSITIVE_PATTERNS,
+  TARGET_PUBLISHED_ITEMS,
   TOPICS_HINTS
 } from "./constants.mjs";
 import {
@@ -19,6 +22,7 @@ import {
 
 const GENERIC_DOMAIN_SET = new Set(GENERIC_DOMAINS);
 const TARGET_CATEGORIES = new Set(["AI IDE", "Coding Agent", "App Builder", "Website Builder", "Code Assistant"]);
+const SOFT_EXCLUSION_LABELS = new Set(["looks like a demo", "looks prompt-focused instead of product-focused"]);
 
 function matchPatterns(text, patterns) {
   const reasons = [];
@@ -193,11 +197,16 @@ export function scoreCandidate(input) {
     reasons.push("has canonical domain");
   }
 
-  const categories = classify(text);
+  const categories = unique([...(input.seed_categories ?? []), ...classify(text)]);
   const targetCategoryCount = categories.filter((category) => TARGET_CATEGORIES.has(category)).length;
   if (targetCategoryCount) {
     score += Math.min(8, targetCategoryCount * 4);
     reasons.push(`classified as ${categories.join(", ")}`);
+  }
+
+  if ((input.seed_categories ?? []).length) {
+    score += Math.min(6, input.seed_categories.length * 2);
+    reasons.push(`matched targeted discovery: ${input.seed_categories.join(", ")}`);
   }
 
   if (positive.score < 14 && targetCategoryCount === 0) {
@@ -223,7 +232,7 @@ export function scoreCandidate(input) {
   const boundedScore = Math.max(0, Math.min(100, score));
   const normalizedName = normalizeName(name);
   const slugBase = slugify(name || domain || normalizedName || "tool");
-  const published = boundedScore >= AUTO_PUBLISH_SCORE;
+  const strictPublished = boundedScore >= AUTO_PUBLISH_SCORE;
 
   return {
     ...input,
@@ -239,10 +248,97 @@ export function scoreCandidate(input) {
     summary: truncate(input.summary ?? input.description ?? ""),
     description: truncate(input.description ?? input.summary ?? "", 320),
     categories,
+    positive_score: positive.score,
+    negative_score: negative.score,
+    target_category_count: targetCategoryCount,
     score: boundedScore,
     reasons: unique(reasons),
-    published
+    strict_published: strictPublished,
+    published: strictPublished,
+    publication_tier: strictPublished ? "strict" : null
   };
+}
+
+function hasExternalDomain(item) {
+  return Boolean(item.domain && !GENERIC_DOMAIN_SET.has(item.domain));
+}
+
+function hasHardExclusion(item) {
+  return (item.reasons ?? []).some((reason) => HARD_EXCLUSION_LABELS.has(reason));
+}
+
+function hasSoftExclusion(item) {
+  return (item.reasons ?? []).some((reason) => SOFT_EXCLUSION_LABELS.has(reason));
+}
+
+function isExpandedEligible(item) {
+  if (item.strict_published) {
+    return true;
+  }
+
+  if ((item.score ?? 0) < EXPANDED_PUBLISH_SCORE) {
+    return false;
+  }
+
+  if (hasHardExclusion(item)) {
+    return false;
+  }
+
+  const externalDomain = hasExternalDomain(item);
+  const hasCategories = (item.target_category_count ?? 0) > 0;
+  const strongTextSignal = (item.positive_score ?? 0) >= 12;
+  const hasSeedCategory = (item.seed_categories ?? []).length > 0;
+
+  if (item.source === "github") {
+    const adoptedRepo = (item.stars ?? 0) >= 5 || (item.forks ?? 0) >= 2;
+    const anchoredRepo = externalDomain || (item.stars ?? 0) >= 20 || (item.forks ?? 0) >= 8;
+    return (
+      (hasCategories || strongTextSignal || hasSeedCategory || externalDomain || (item.stars ?? 0) >= 20) &&
+      anchoredRepo &&
+      adoptedRepo &&
+      (!hasSoftExclusion(item) || (item.stars ?? 0) >= 50)
+    );
+  }
+
+  if (item.source === "hackernews") {
+    return externalDomain && ((item.hnScore ?? 0) >= 5 || /^show hn:/i.test(item.name ?? "")) && (hasCategories || strongTextSignal);
+  }
+
+  if (item.source === "rss") {
+    return externalDomain && (item.score ?? 0) >= 40 && (hasCategories || strongTextSignal);
+  }
+
+  return false;
+}
+
+export function selectPublished(items) {
+  const strict = items
+    .filter((item) => item.strict_published)
+    .map((item) => ({ ...item, published: true, publication_tier: "strict" }));
+
+  if (strict.length >= TARGET_PUBLISHED_ITEMS) {
+    return strict.slice(0, TARGET_PUBLISHED_ITEMS);
+  }
+
+  const strictIds = new Set(strict.map((item) => item.id));
+  const expandedPool = items
+    .filter((item) => !strictIds.has(item.id) && isExpandedEligible(item))
+    .sort((left, right) => right.score - left.score || (right.stars ?? 0) - (left.stars ?? 0) || left.name.localeCompare(right.name));
+
+  const selected = [...strict];
+  for (const item of expandedPool) {
+    selected.push({
+      ...item,
+      published: true,
+      publication_tier: "expanded",
+      reasons: unique([...(item.reasons ?? []), "included via extended catalog coverage"])
+    });
+    if (selected.length >= TARGET_PUBLISHED_ITEMS) {
+      break;
+    }
+  }
+
+  return selected.sort((left, right) => right.score - left.score || left.name.localeCompare(right.name));
 }
 
 export function mergeCandidates(items) {
@@ -277,6 +373,7 @@ export function mergeCandidates(items) {
       ...winner,
       aliases: unique([...(existing.aliases ?? []), existing.name, item.name]),
       categories: unique([...(existing.categories ?? []), ...(item.categories ?? [])]),
+      seed_categories: unique([...(existing.seed_categories ?? []), ...(item.seed_categories ?? [])]),
       reasons: unique([...(existing.reasons ?? []), ...(item.reasons ?? [])]),
       tags: unique([...(existing.tags ?? []), ...(item.tags ?? [])]),
       topics: unique([...(existing.topics ?? []), ...(item.topics ?? [])]),
@@ -299,7 +396,11 @@ export function mergeCandidates(items) {
     }
 
     mergedItem.score = Math.max(existing.score, item.score);
-    mergedItem.published = mergedItem.score >= AUTO_PUBLISH_SCORE;
+    mergedItem.positive_score = Math.max(existing.positive_score ?? 0, item.positive_score ?? 0);
+    mergedItem.negative_score = Math.min(existing.negative_score ?? 0, item.negative_score ?? 0);
+    mergedItem.target_category_count = Math.max(existing.target_category_count ?? 0, item.target_category_count ?? 0);
+    mergedItem.strict_published = mergedItem.score >= AUTO_PUBLISH_SCORE;
+    mergedItem.published = mergedItem.strict_published;
     merged.set(key, mergedItem);
   }
 

@@ -1,13 +1,15 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { AUTO_PUBLISH_SCORE, KEYWORD_QUERIES } from "../src/lib/constants.mjs";
 import { parseFeed } from "../src/lib/feeds.mjs";
-import { mergeCandidates, scoreCandidate } from "../src/lib/scoring.mjs";
+import { mergeCandidates, scoreCandidate, selectPublished } from "../src/lib/scoring.mjs";
 import { chunk, cleanText, dateToIso, stableId, unique } from "../src/lib/utils.mjs";
 
 const ROOT = process.cwd();
 const CONFIG_DIR = path.join(ROOT, "config");
 const GENERATED_DIR = path.join(ROOT, "data", "generated");
+const GITHUB_SEARCH_DELAY_MS = 2200;
 
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, options);
@@ -25,51 +27,73 @@ async function fetchText(url, options = {}) {
   return response.text();
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function githubHeaders() {
+  let token = process.env.GITHUB_TOKEN;
+  if (!token) {
+    try {
+      token = execFileSync("gh", ["auth", "token"], { encoding: "utf8" }).trim();
+    } catch {
+      token = "";
+    }
+  }
+
   const headers = {
     Accept: "application/vnd.github+json",
     "User-Agent": "vibe-coding-catalog"
   };
-  if (process.env.GITHUB_TOKEN) {
-    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
   }
   return headers;
 }
 
 async function collectGithub() {
   const items = [];
-  for (const query of KEYWORD_QUERIES) {
-    const searchUrl = new URL("https://api.github.com/search/repositories");
-    searchUrl.searchParams.set("q", `${query} in:name,description,readme`);
-    searchUrl.searchParams.set("sort", "updated");
-    searchUrl.searchParams.set("order", "desc");
-    searchUrl.searchParams.set("per_page", "10");
+  const headers = githubHeaders();
 
-    try {
-      const payload = await fetchJson(searchUrl, { headers: githubHeaders() });
-      for (const repo of payload.items ?? []) {
-        const homepage = repo.homepage?.trim() ? repo.homepage.trim() : null;
-        items.push({
-          id: stableId("github", repo.full_name),
-          source: "github",
-          name: repo.name,
-          summary: cleanText(repo.description ?? ""),
-          description: cleanText(repo.description ?? ""),
-          url: homepage || repo.html_url,
-          homepage,
-          repo_url: repo.html_url,
-          source_url: repo.html_url,
-          stars: repo.stargazers_count ?? 0,
-          forks: repo.forks_count ?? 0,
-          topics: repo.topics ?? [],
-          archived: repo.archived ?? false,
-          updated_at: repo.updated_at,
-          tags: unique([repo.language, ...(repo.topics ?? [])]),
-          discovered_at: new Date().toISOString()
-        });
+  for (const searchPlan of KEYWORD_QUERIES) {
+    for (let page = 1; page <= searchPlan.pages; page += 1) {
+      const searchUrl = new URL("https://api.github.com/search/repositories");
+      searchUrl.searchParams.set("q", `${searchPlan.query} in:name,description,readme`);
+      searchUrl.searchParams.set("sort", searchPlan.sort);
+      searchUrl.searchParams.set("order", "desc");
+      searchUrl.searchParams.set("per_page", String(searchPlan.perPage));
+      searchUrl.searchParams.set("page", String(page));
+
+      try {
+        const payload = await fetchJson(searchUrl, { headers });
+        for (const repo of payload.items ?? []) {
+          const homepage = repo.homepage?.trim() ? repo.homepage.trim() : null;
+          items.push({
+            id: stableId("github", repo.full_name),
+            source: "github",
+            name: repo.name,
+            summary: cleanText(repo.description ?? ""),
+            description: cleanText(repo.description ?? ""),
+            url: homepage || repo.html_url,
+            homepage,
+            repo_url: repo.html_url,
+            source_url: repo.html_url,
+            stars: repo.stargazers_count ?? 0,
+            forks: repo.forks_count ?? 0,
+            topics: repo.topics ?? [],
+            archived: repo.archived ?? false,
+            updated_at: repo.updated_at,
+            tags: unique([repo.language, ...(repo.topics ?? [])]),
+            seed_categories: searchPlan.categories,
+            matched_query: searchPlan.label,
+            discovered_at: new Date().toISOString()
+          });
+        }
+      } catch (error) {
+        console.warn(`[github] ${searchPlan.label} page ${page}: ${error.message}`);
       }
-    } catch (error) {
-      console.warn(`[github] ${query}: ${error.message}`);
+
+      await sleep(GITHUB_SEARCH_DELAY_MS);
     }
   }
 
@@ -165,7 +189,7 @@ async function collectFeeds() {
 function enrichCatalog(items) {
   const scored = items.map(scoreCandidate);
   const merged = mergeCandidates(scored);
-  const published = merged.filter((item) => item.published);
+  const published = selectPublished(merged);
   return { scored, merged, published };
 }
 
@@ -200,6 +224,8 @@ async function main() {
     raw_candidates: raw.items.length,
     deduped_candidates: merged.length,
     published_candidates: published.length,
+    strict_published_candidates: published.filter((item) => item.publication_tier === "strict").length,
+    expanded_published_candidates: published.filter((item) => item.publication_tier === "expanded").length,
     sources: raw.sources
   };
 
